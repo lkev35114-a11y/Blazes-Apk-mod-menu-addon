@@ -5,6 +5,7 @@
 //   Touch a button with your other index finger to press it
 //   < and > on the sides    -> previous / next page
 //   Pages: Movement Mods, Rig Mods, Items, Settings, Enabled Mods
+//   Hold X (left hand)      -> emote wheel: point with your right finger, let go to dance
 // Movement only changes your own game. Rig mods (dances) and Items are seen by the room,
 // within the limits in AGENTS.md ("Things others see"). Read docs/GUIDE.md before adding.
 #include "ymsdk.hpp"
@@ -329,6 +330,7 @@ static int g_dupeArmed = 0;
 static constexpr int kDances = 8;
 static bool g_danceSel[kDances];
 static int g_dance = -1;            // the picked dance, -1 = none
+static bool f_emoteWheel = true;    // Settings > Emote Wheel (hold X to open it)
 static bool f_fly, f_fastFly, f_platforms, f_lowGravity, f_rainbow, f_fps, f_clock, f_rightHand,
             f_notify = true;
 static Ref g_player, g_rigidbody, g_leftHand, g_rightHand, g_head;
@@ -347,6 +349,7 @@ static void NextCarSpeed();
 static void ApplySpeedBoost();
 static void ApplyGravity();
 static void DancePicked();
+static void StopEmote();
 static void ArmDupe9();
 static void ArmDupe27();
 static bool LeftHandItem();
@@ -407,6 +410,7 @@ static Item g_items[] = {
     {SETTINGS, "Iron Man Speed", ACTION, MAIN, nullptr, NextIronSpeed},
     {SETTINGS, "Car Speed", ACTION, MAIN, nullptr, NextCarSpeed},
     {SETTINGS, "Right Hand Menu", TOGGLE, MAIN, &f_rightHand, PointerToHand},
+    {SETTINGS, "Emote Wheel", TOGGLE, MAIN, &f_emoteWheel, StopEmote},
     {SETTINGS, "Change Menu Theme", ACTION, MAIN, nullptr, NextTheme},
     {SETTINGS, "Rainbow Menu", TOGGLE, MAIN, &f_rainbow},
     {SETTINGS, "Show FPS", TOGGLE, MAIN, &f_fps},
@@ -457,6 +461,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
+    {"Emote Wheel", "Hold X, point with your right finger, let go to dance. X or a grip stops it."},
     {"Notifications", "Messages when you switch something."},
     {"Turn Everything Off", "Switches every mod off."},
 };
@@ -508,7 +513,8 @@ static void BuildView() {
     g_view.clear();
     if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
-        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify) g_view.push_back(&it);
+        for (auto &it : g_items)
+            if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_emoteWheel) g_view.push_back(&it);
     } else {
         for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
     }
@@ -874,8 +880,10 @@ static int g_ironSpeed = 0;
 static void NextIronSpeed() { g_ironSpeed = (g_ironSpeed + 1) % 4; Notify("Iron Man speed: %d", (int)kIronSpeeds[g_ironSpeed]); }
 static void NextTheme() { g_theme = (g_theme + 1) % kThemeCount; Notify("Theme: %s", T().name); }
 static void AllOff() {
-    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify) *it.flag = false;   // ticks undo each mod
+    for (auto &it : g_items)
+        if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_emoteWheel) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
+    StopEmote();
     g_dupeArmed = 0;
     g_itemQueue.clear();
     PointerToHand();
@@ -1144,6 +1152,16 @@ static float Rand01() { static uint32_t x = 2463534242u; x ^= x << 13; x ^= x >>
 
 // The controller trackers would put your hands back every frame, so they are paused
 // while you dance (on the hand and the two objects above it) and turned back on after.
+// Emote wheel state. An emote is a dance that plays by itself (no trigger hold) until it
+// ends, you squeeze a grip, or you press X. It moves your hands through DanceTick below.
+static constexpr int kEmotes = 8;
+static constexpr float kEmoteSeconds = 12.0f;
+static const float kPi = 3.14159265f;
+static bool g_emoteActive = false;
+static int g_emote = 0;
+static double g_emoteStart = 0, g_emoteEnd = 0;
+static void StopEmote() { g_emoteActive = false; }
+
 static Ref g_paused[12];
 static int g_pausedN = 0;
 static bool g_dancing = false;
@@ -1170,7 +1188,8 @@ static void PauseTrackers(bool pause) {
 
 static void DanceTick(const Buttons &in, float dt) {
     Il2CppObject *head = g_head.get(), *lh = g_leftHand.get(), *rh = g_rightHand.get();
-    bool want = g_dance >= 0 && in.ltrig && head && lh && rh;
+    bool emote = g_emoteActive;
+    bool want = (emote || (g_dance >= 0 && in.ltrig)) && head && lh && rh;
     if (want != g_dancing) {
         PauseTrackers(want);
         g_dancing = want;
@@ -1180,9 +1199,13 @@ static void DanceTick(const Buttons &in, float dt) {
     Vector3 hp = G.trGetPosition[head](), f = Flat(G.trGetForward[head]()), up(0, 1, 0);
     Vector3 r = Cross(up, f);                            // your right
     Vector3 shoulder = hp + up * -0.25f;
-    float t = (float)g_time, s = sinf(t * 6), c = cosf(t * 6);
+    float t = (float)(emote ? g_time - g_emoteStart : g_time);   // emotes always start at phase 0
+    float s = sinf(t * 6), c = cosf(t * 6);
+    (void)c;
+    int mode = emote ? 100 + g_emote : g_dance;
+    auto pos = [](float x) { return x > 0 ? x : 0.0f; };        // only the positive half of a wave
     Vector3 L, R;                                        // hand positions
-    switch (g_dance) {
+    switch (mode) {
     case 0:   // Wave: right hand up and waving, left hand on the hip
         R = shoulder + r * (0.35f + 0.12f * s) + up * 0.45f + f * 0.1f;
         L = shoulder + r * -0.25f + up * -0.25f + f * 0.05f;
@@ -1215,6 +1238,53 @@ static void DanceTick(const Buttons &in, float dt) {
         R = shoulder + f * 0.35f + r * 0.2f + Vector3(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f) * 0.3f;
         L = shoulder + f * 0.35f - r * 0.2f + Vector3(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f) * 0.3f;
         break;
+    // ---- emote wheel poses: original hand motions inspired by popular dances ----
+    case 100: {  // Orange Justice: arms swing front and back in opposite loops, with a sway
+        float p = t * 8, sway = 0.06f * sinf(p * 0.5f);
+        R = shoulder + r * (0.32f + sway) + f * (0.38f * sinf(p)) + up * (-0.12f + 0.12f * cosf(p));
+        L = shoulder - r * (0.32f - sway) + f * (0.38f * sinf(p + kPi)) + up * (-0.12f + 0.12f * cosf(p + kPi));
+        break;
+    }
+    case 101: {  // Floss: both arms swing side to side at your hips
+        float sw = 0.34f * sinf(t * 7);
+        Vector3 base = shoulder - up * 0.45f - f * 0.12f;
+        R = base + r * (0.14f + sw);
+        L = base + r * (-0.14f + sw);
+        break;
+    }
+    case 102: {  // Default Dance: arms sweep forward and up in arcs, one after the other
+        float p = t * 4.5f;
+        R = shoulder + r * 0.25f + f * (0.25f + 0.2f * cosf(p)) + up * (0.1f + 0.35f * sinf(p));
+        L = shoulder - r * 0.25f + f * (0.25f + 0.2f * cosf(p + kPi * 0.5f)) + up * (0.1f + 0.35f * sinf(p + kPi * 0.5f));
+        break;
+    }
+    case 103: {  // Take the L: one hand at your forehead, the other swings across
+        R = hp + up * 0.12f + f * 0.2f + r * 0.08f;
+        L = shoulder - r * (0.2f + 0.3f * sinf(t * 5)) + f * 0.15f - up * 0.05f;
+        break;
+    }
+    case 104: {  // Hype: both fists up high, pumping in turns
+        float p = t * 9;
+        R = shoulder + r * 0.28f + up * (0.5f + 0.18f * sinf(p));
+        L = shoulder - r * 0.28f + up * (0.5f + 0.18f * sinf(p + kPi));
+        break;
+    }
+    case 105:   // Dab: one arm up and out, the other tucked across your face
+        R = shoulder + r * 0.55f + up * 0.4f + f * 0.1f;
+        L = hp + f * 0.13f - up * 0.04f + r * 0.02f;
+        break;
+    case 106: {  // Disco Fever: point up high, then the other hand, back and forth
+        float a = sinf(t * 3);
+        R = shoulder + r * (0.25f + 0.3f * pos(a)) + up * (-0.2f + 0.7f * pos(a));
+        L = shoulder - r * (0.25f + 0.3f * pos(-a)) + up * (-0.2f + 0.7f * pos(-a));
+        break;
+    }
+    case 107: {  // Boogie Down: fists pump forward in turns at chest height
+        float p = t * 7;
+        R = shoulder + r * 0.22f + f * (0.18f + 0.2f * sinf(p)) - up * 0.12f;
+        L = shoulder - r * 0.22f + f * (0.18f + 0.2f * sinf(p + kPi)) - up * 0.12f;
+        break;
+    }
     default:  // Beyblade: hands spin fast around your waist
         R = shoulder - up * 0.3f + r * (0.5f * cosf(t * 20)) + f * (0.5f * sinf(t * 20));
         L = shoulder - up * 0.3f - r * (0.5f * cosf(t * 20)) - f * (0.5f * sinf(t * 20));
@@ -1229,12 +1299,116 @@ static void DanceTick(const Buttons &in, float dt) {
     };
     R = reach(R, shoulder + r * 0.18f);
     L = reach(L, shoulder - r * 0.18f);
-    float k = g_dance == 6 ? 1.0f : fminf(1.0f, dt * 14.0f);     // Spaz stays twitchy
+    float k = mode == 6 ? 1.0f : fminf(1.0f, dt * 14.0f);        // Spaz stays twitchy
     G.trSetPosition[lh](G.trGetPosition[lh]() + (L - G.trGetPosition[lh]()) * k);
     G.trSetPosition[rh](G.trGetPosition[rh]() + (R - G.trGetPosition[rh]()) * k);
     Quaternion look = Quaternion::LookRotation(f, up);
     G.trSetRotation[lh](look);
     G.trSetRotation[rh](look);
+}
+
+// ---- emote wheel ------------------------------------------------------------------
+// Hold X: a ring of 8 emotes appears in front of you. Point at one with your right index
+// finger and let go of X to play it. It plays by itself through DanceTick (your hands are
+// moved, the game sends your pose as usual, nothing extra is sent). Press X again or
+// squeeze a grip to stop. Settings > Emote Wheel turns the whole thing off.
+static const char *kEmoteName[kEmotes] = {"Orange Justice", "Floss", "Default Dance", "Take the L",
+                                          "Hype", "Dab", "Disco Fever", "Boogie Down"};
+static const float kWheelR = 0.17f, kSlotSize = 0.085f;
+static Ref g_wheel, g_wheelHub, g_wheelText, g_wheelSlot[kEmotes];
+static bool g_wheelBuilt = false, g_wheelShown = false;
+static int g_wheelHover = -2;                 // -2 = just opened, -1 = middle / nowhere, 0..7 = slot
+static double g_wheelBlockUntil = 0;
+
+static Vector3 WheelSlotPos(int i) {          // slot 0 at the top, going clockwise
+    float a = i * (kPi / 4);
+    return Vector3(kWheelR * sinf(a), kWheelR * cosf(a), 0);
+}
+
+// Built once per room, then only shown, hidden, moved and recolored.
+static void BuildWheel() {
+    Il2CppObject *root = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("BlazeEmoteWheel"));
+    if (!root) return;
+    g_wheel.set(root);
+    Il2CppObject *rt = Tr(root);
+    g_wheelHub.set(Part(rt, T().buttonOn, Vector3(0, 0, 0), Vector3(0.075f, 0.075f, 0.01f)));
+    for (int i = 0; i < kEmotes; i++)
+        g_wheelSlot[i].set(Part(rt, T().button, WheelSlotPos(i), Vector3(kSlotSize, kSlotSize, 0.01f)));
+    // The player looks at the wheel from its -z side, like the menu board.
+    if (Il2CppObject *canvas = Canvas(rt, Vector3(0, 0, -0.0075f), 0.5f, 0.5f)) {
+        Il2CppObject *ct = Tr(canvas);
+        for (int i = 0; i < kEmotes; i++) Label(ct, kEmoteName[i], WheelSlotPos(i), kSlotSize, 0.04f, 14, nullptr);
+        Label(ct, "Emotes", Vector3(0, 0, 0), 0.075f, 0.04f, 13, &g_wheelText);
+    }
+    G.goSetActive[root](false);
+    g_wheelBuilt = true;
+}
+
+static void SetWheelShown(bool on) {
+    if (on == g_wheelShown) return;
+    g_wheelShown = on;
+    Show(g_wheel, on);
+}
+
+// The slot your right index finger points at, -1 for the middle or too far away.
+static int WheelHit() {
+    Il2CppObject *root = g_wheel.get(), *rh = g_rightHand.get();
+    if (!Alive(root) || !rh) return -1;
+    Vector3 tip = G.trTransformPoint[rh](kPointerSpots[0]);       // where the menu's pointer ball sits
+    Vector3 p = G.trInverseTransformPoint[Tr(root)](tip);
+    float d = sqrtf(p.x * p.x + p.y * p.y);
+    if (d < 0.05f || d > 0.5f) return -1;
+    int i = (int)floorf(atan2f(p.x, p.y) / (kPi / 4) + 0.5f);
+    return ((i % kEmotes) + kEmotes) % kEmotes;
+}
+
+static void StartEmote(int i) {
+    g_emote = i;
+    g_emoteActive = true;
+    g_emoteStart = g_time;
+    g_emoteEnd = g_time + kEmoteSeconds;
+    Notify("%s  (X or a grip to stop)", kEmoteName[i]);
+    ym::log("starter-menu: emote %s", kEmoteName[i]);
+}
+
+static void WheelTick(const Buttons &in) {
+    if (!g_wheelShown && !g_emoteActive && !in.x) return;         // nothing on: almost free
+    if (g_emoteActive && (in.lgrip || in.rgrip || g_time >= g_emoteEnd)) StopEmote();
+    if (g_emoteActive && in.x && f_emoteWheel) {                  // X gives your hands back so you can pick again
+        StopEmote();
+        g_wheelBlockUntil = g_time + 0.2;
+    }
+    // Iron Man uses X, so the wheel stays out of its way. The menu (Y) has priority too.
+    bool want = f_emoteWheel && in.x && !in.a && !f_ironMan && !g_menuShown && !g_emoteActive &&
+                g_time >= g_wheelBlockUntil;
+    if (want && !g_wheelShown) {
+        if (!g_wheelBuilt) BuildWheel();
+        Il2CppObject *root = g_wheel.get(), *head = g_head.get();
+        if (!Alive(root) || !head) return;
+        Vector3 f = Flat(G.trGetForward[head]());
+        Il2CppObject *rt = Tr(root);
+        G.trSetPosition[rt](G.trGetPosition[head]() + f * 0.55f + Vector3(0, -0.08f, 0));
+        G.trSetRotation[rt](Quaternion::LookRotation(f, Vector3(0, 1, 0)));
+        for (int i = 0; i < kEmotes; i++) SetColor(g_wheelSlot[i].get(), T().button);
+        SetColor(g_wheelHub.get(), T().buttonOn);
+        SetText(g_wheelText, "Emotes");
+        g_wheelHover = -2;
+        SetWheelShown(true);
+    }
+    if (!g_wheelShown) return;
+    if (!want) {                                                  // X let go (or the wheel lost its right to be open)
+        int pick = g_wheelHover;
+        SetWheelShown(false);
+        if (!in.x && pick >= 0) StartEmote(pick);
+        return;
+    }
+    int h = WheelHit();
+    if (h != g_wheelHover) {                                      // only touches objects when the choice changes
+        if (g_wheelHover >= 0) SetColor(g_wheelSlot[g_wheelHover].get(), T().button);
+        if (h >= 0) { SetColor(g_wheelSlot[h].get(), Color(1, 0.9f, 0.6f, 1)); Buzz(); }
+        SetText(g_wheelText, h >= 0 ? kEmoteName[h] : "Emotes");
+        g_wheelHover = h;
+    }
 }
 
 // ---- items (everyone sees these) ------------------------------------------------
@@ -1396,7 +1570,13 @@ static void OnRoomChange() {
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
-    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo}) Kill(*r);
+    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo, &g_wheel}) Kill(*r);
+    for (int i = 0; i < kEmotes; i++) g_wheelSlot[i].clear();
+    g_wheelHub.clear();
+    g_wheelText.clear();
+    g_wheelBuilt = false;
+    g_wheelShown = false;
+    g_emoteActive = false;
     PauseTrackers(false);
     g_dancing = false;
     g_gunLine.clear();
@@ -1453,6 +1633,8 @@ static void OnUpdate(float dt) {
     TeleportGunTick(in);
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("starter-menu: item code error"); }
+    try { WheelTick(in); }
+    catch (...) { g_wheelShown = false; g_emoteActive = false; ym::log("starter-menu: emote wheel error"); }
     DanceTick(in, dt);              // last: it moves your hands after everything else
 }
 
