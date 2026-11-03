@@ -1,4 +1,4 @@
-// Prisma Client V1: a hand menu (forked from the starter menu) in the style of ii's Stupid Menu (Gorilla Tag).
+// Prisma Client V2: a hand menu (forked from the starter menu) in the style of ii's Stupid Menu (Gorilla Tag).
 // The layout idea comes from ii's menu; the code is new.
 //   Hold Y (left hand)      -> menu on your left hand, tipped like ii's; turn your palm to you
 //                              (B and the right hand with "Right Hand Menu")
@@ -16,12 +16,17 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <chrono>
+#include <dirent.h>
+#define MINIMP3_IMPLEMENTATION
+#include "minimp3.h"
 
 using namespace BNM;
 using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
-YEEPS_MOD("Prisma Client V1")
+YEEPS_MOD("Prisma Client V2")
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -79,10 +84,15 @@ static struct {
                  lrSetPositionCount, lrSetPosition, lrSetStartWidth, lrSetEndWidth, lrSetUseWorldSpace;
     Method<Quaternion> trGetRotation;
     Method<Vector3> trGetPosition, trGetForward, trGetRight, trGetUp, trInverseTransformPoint, trTransformPoint, rbGetVelocity;
-    Method<bool> alive, tryGetBool, haptic, raycast;
+    Method<bool> alive, tryGetBool, haptic, raycast, tryGetVec3, tryGetQuat;
     Method<XRDevice> deviceAtNode;
     Method<Il2CppObject *> trGetParent, trGetRoot, getComponentsInChildren, netLocal;
-    Method<Il2CppObject *> overlapSphere;
+    Method<Il2CppObject *> overlapSphere, colAttachedRb;
+    Method<void> matSetInt, rsSetFog, rsSetAmbientMode, rsSetAmbientLight;
+    Method<bool> rsGetFog;
+    Method<int> rsGetAmbientMode;
+    Method<Color> rsGetAmbientLight;
+    BNM::MonoType *tJoint = nullptr;
     Method<BNM::Structures::Mono::String *> objGetName;
     Method<void> pvRpc;
     BNM::IL2CPP::MethodInfo *rpcCreateItem = nullptr;     // only read for its parameter types
@@ -210,6 +220,20 @@ static bool Lookups() {
     G.getComponentsInChildren = Overload(go, "GetComponentsInChildren", {"System.Type", "System.Boolean"});
     G.overlapSphere = Overload(Class("UnityEngine", "Physics"), "OverlapSphere", {"UnityEngine.Vector3", "System.Single"});
     G.objGetName = obj.GetMethod("get_name", 0);
+    G.colAttachedRb = Class("UnityEngine", "Collider").GetMethod("get_attachedRigidbody", 0);
+    { Class jt("UnityEngine", "Joint"); G.tJoint = jt.IsValid() ? jt.GetMonoType() : nullptr; }
+    G.tryGetVec3 = dev.GetMethod("TryGetFeatureValue_Vector3", 3);
+    G.tryGetQuat = dev.GetMethod("TryGetFeatureValue_Quaternion", 3);
+    G.matSetInt = Overload(mat, "SetInt", {"System.String", "System.Int32"});
+    {
+        Class rs("UnityEngine", "RenderSettings");
+        G.rsSetFog = rs.GetMethod("set_fog", 1);
+        G.rsGetFog = rs.GetMethod("get_fog", 0);
+        G.rsSetAmbientMode = rs.GetMethod("set_ambientMode", 1);
+        G.rsGetAmbientMode = rs.GetMethod("get_ambientMode", 0);
+        G.rsSetAmbientLight = rs.GetMethod("set_ambientLight", 1);
+        G.rsGetAmbientLight = rs.GetMethod("get_ambientLight", 0);
+    }
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
     if (net.IsValid()) {
         G.netLocal = net.GetMethod("get_local", 0);
@@ -325,13 +349,16 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity, f_longArms, f_rope;
 static bool f_itemGun, f_spawnOnHand, f_car;
+static bool f_esp, f_espTracers = true, f_noFog, f_bright, f_speedo;
+static bool g_inSounds = false, g_armsTracker = false, g_trackerBad = false;
+static float g_speedNow = 0;
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
 static std::vector<PendingItem> g_itemQueue;
 static double g_nextItem = 0, g_nextBatch = 0;
 static int g_dupeArmed = 0;
 
-static constexpr int kDances = 8;
+static constexpr int kDances = 11;
 static bool g_danceSel[kDances];
 static int g_dance = -1;            // the picked dance, -1 = none
 static bool f_fly, f_fastFly, f_platforms, f_lowGravity, f_rainbow, f_fps, f_clock, f_rightHand,
@@ -359,6 +386,9 @@ static void NextPointerSize();
 static void NextLayoutSize();
 static void ApplyLook();
 static void ResetMotionState();
+static void NextArmMethod();
+static void ScanSounds();
+static void V2Reset();
 static void ApplyGravity();
 static void DancePicked();
 static void ArmDupe9();
@@ -378,8 +408,9 @@ enum LayoutId {
 LAYOUT_LIST(X)
 #undef X
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, LAYOUTS, SETTINGS, LOOK, ENABLED, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Item Layouts", "Settings", "Menu Look", "Enabled Mods"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, LAYOUTS, SETTINGS, LOOK, SOUNDS, VISUALS, CREDITS, ENABLED, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Item Layouts", "Settings", "Menu Look", "Soundboard",
+                                  "Visual Mods", "Credits", "Enabled Mods"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -388,7 +419,9 @@ struct Item {
     Cat target = MAIN;            // OPEN: the page it opens
     bool *flag = nullptr;         // TOGGLE: the switch
     void (*fn)() = nullptr;       // ACTION, or called after a TOGGLE changes
+    int arg = 0;                  // handed to fn through g_pressArg (the soundboard buttons)
 };
+static int g_pressArg = 0;
 // The owner's layout (2026-10-31). Keep this order.
 static Item g_items[] = {
     {MAIN, "Settings", OPEN, SETTINGS},
@@ -396,6 +429,9 @@ static Item g_items[] = {
     {MAIN, "Rig Mods", OPEN, RIG},
     {MAIN, "Items", OPEN, ITEMS},
     {MAIN, "Menu Look", OPEN, LOOK},
+    {MAIN, "Soundboard", OPEN, SOUNDS},
+    {MAIN, "Visual Mods", OPEN, VISUALS},
+    {MAIN, "Credits", OPEN, CREDITS},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
@@ -425,6 +461,9 @@ static Item g_items[] = {
     {RIG, "Jumping Jacks", TOGGLE, MAIN, &g_danceSel[5], DancePicked},
     {RIG, "Spaz", TOGGLE, MAIN, &g_danceSel[6], DancePicked},
     {RIG, "Beyblade", TOGGLE, MAIN, &g_danceSel[7], DancePicked},
+    {RIG, "Bird", TOGGLE, MAIN, &g_danceSel[8], DancePicked},
+    {RIG, "Clap", TOGGLE, MAIN, &g_danceSel[9], DancePicked},
+    {RIG, "Boxing", TOGGLE, MAIN, &g_danceSel[10], DancePicked},
 
     {ITEMS, "Exit Items", OPEN, MAIN},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
@@ -452,12 +491,24 @@ static Item g_items[] = {
     {LAYOUTS, "Hi", ACTION, MAIN, nullptr, LayHi},
     {LAYOUTS, "Hello (2 parts)", ACTION, MAIN, nullptr, LayHello},
 
+    {VISUALS, "Exit Visual Mods", OPEN, MAIN},
+    {VISUALS, "ESP", TOGGLE, MAIN, &f_esp},
+    {VISUALS, "ESP Tracers", TOGGLE, MAIN, &f_espTracers},
+    {VISUALS, "No Fog", TOGGLE, MAIN, &f_noFog},
+    {VISUALS, "Bright World", TOGGLE, MAIN, &f_bright},
+
+    {CREDITS, "Exit Credits", OPEN, MAIN},
+    {CREDITS, "Prisma Client V2", ACTION},
+    {CREDITS, "Created by", ACTION},
+    {CREDITS, "tmm.ka_yt", ACTION},
+
     {SETTINGS, "Exit Settings", OPEN, MAIN},
     {SETTINGS, "Change Pointer Position", ACTION, MAIN, nullptr, NextPointer},
     {SETTINGS, "Iron Man Speed", ACTION, MAIN, nullptr, NextIronSpeed},
     {SETTINGS, "Car Speed", ACTION, MAIN, nullptr, NextCarSpeed},
     {SETTINGS, "Boost Strength", ACTION, MAIN, nullptr, NextBoost},
     {SETTINGS, "Arm Length", ACTION, MAIN, nullptr, NextArm},
+    {SETTINGS, "Arm Method", ACTION, MAIN, nullptr, NextArmMethod},
     {SETTINGS, "Rope Power", ACTION, MAIN, nullptr, NextRopePower},
     {SETTINGS, "Right Hand Menu", TOGGLE, MAIN, &f_rightHand, PointerToHand},
     {SETTINGS, "Notifications", TOGGLE, MAIN, &f_notify},
@@ -474,9 +525,12 @@ static Item g_items[] = {
     {LOOK, "Pointer Size", ACTION, MAIN, nullptr, NextPointerSize},
     {LOOK, "Show FPS", TOGGLE, MAIN, &f_fps},
     {LOOK, "Show Clock", TOGGLE, MAIN, &f_clock},
+    {LOOK, "Show Speed", TOGGLE, MAIN, &f_speedo},
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
+static Item g_soundExit = {SOUNDS, "Exit Soundboard", OPEN, MAIN};
+static std::vector<Item> g_soundItems;                         // filled by ScanSounds()
 
 // Tooltips, shown under the menu while your finger is on a button (like ii's).
 static const struct { const char *label, *tip; } kTips[] = {
@@ -520,6 +574,21 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Right Hand Menu", "Hold B, menu on your right hand."},
     {"Notifications", "Messages when you switch something."},
     {"Menu Look", "Change how the menu looks."},
+    {"Soundboard", "Plays .mp3 or .wav files from the mods/sounds folder through your mic."},
+    {"Visual Mods", "Things only you see."},
+    {"Credits", "Who made this."},
+    {"Prisma Client V2", "Just a credit, it does nothing."},
+    {"Created by", "Just a credit, it does nothing."},
+    {"tmm.ka_yt", "Creator of Prisma Client. Just a credit, it does nothing."},
+    {"ESP", "A box around every other player. Only you see it."},
+    {"ESP Tracers", "Also a line from your right hand to each player."},
+    {"No Fog", "Turns the fog off for you."},
+    {"Bright World", "Lights the whole world evenly for you."},
+    {"Show Speed", "Your speed in the title."},
+    {"Arm Method", "Auto, tracker or simple. Try another if Long Arms does nothing."},
+    {"Bird", "Both arms flap like wings. Hold left trigger."},
+    {"Clap", "Hands clap in front of you. Hold left trigger."},
+    {"Boxing", "Punches, left then right. Hold left trigger."},
     {"Item Layouts", "Pictures made from the item in your hand. Everyone sees them."},
     {"Floor Mode", "Lays the picture flat on the ground instead of standing it up."},
     {"Layout Size", "How far apart the items in a picture are."},
@@ -553,6 +622,7 @@ static const struct { const char *label, *tip; } kTips[] = {
 };
 static const char *TipFor(const char *label) {
     if (strncmp(label, "Exit ", 5) == 0) return "Returns you back to the main category.";
+    if (g_inSounds) return "Plays through your mic. One at a time.";
     for (auto &t : kTips) if (strcmp(t.label, label) == 0) return t.tip;
     return "";
 }
@@ -609,9 +679,13 @@ static int PageCount() { return g_view.empty() ? 1 : (int)(g_view.size() + kRows
 
 static void BuildView() {
     g_view.clear();
+    g_inSounds = g_cat == SOUNDS;
     if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
         for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.cat != LOOK) g_view.push_back(&it);
+    } else if (g_cat == SOUNDS) {
+        g_view.push_back(&g_soundExit);
+        for (auto &it : g_soundItems) g_view.push_back(&it);
     } else {
         for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
     }
@@ -718,7 +792,7 @@ static void BuildMenu() {
         Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, "", Vector3(0, -kBoardH / 2 - 0.02f, 0), kBoardW + 0.1f, 0.03f, 15, &g_tipText);
         char ver[64];
-        snprintf(ver, sizeof ver, "Prisma Client V1 | game %s", ym::api()->gameVersion);
+        snprintf(ver, sizeof ver, "Prisma Client V2 | game %s", ym::api()->gameVersion);
         Label(ct, ver, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
     }
     // Pointer: a small ball on the index finger of the other hand
@@ -782,7 +856,7 @@ static void RenderPage() {
 
 static int Hex(float v) { return (int)(v < 0 ? 0 : v > 1 ? 255 : v * 255); }
 
-// The title is "Prisma Client V1" with a moving gradient, one color per letter
+// The title is "Prisma Client V2" with a moving gradient, one color per letter
 // (rich text). Rebuilt ten times a second, not every frame.
 static void UpdateTitle() {
     if (g_time < g_nextTitle) return;
@@ -805,9 +879,10 @@ static void UpdateTitle() {
         }
         n += snprintf(buf + n, sizeof buf - n, "<b><color=#%02X%02X%02X>%c</color></b>", Hex(c.r), Hex(c.g), Hex(c.b), word[i]);
     }
-    n += snprintf(buf + n, sizeof buf - n, "<size=20><color=#%02X%02X%02X><b> Client V1</b></color></size>", Hex(th.title.r), Hex(th.title.g), Hex(th.title.b));
+    n += snprintf(buf + n, sizeof buf - n, "<size=20><color=#%02X%02X%02X><b> Client V2</b></color></size>", Hex(th.title.r), Hex(th.title.g), Hex(th.title.b));
     n += snprintf(buf + n, sizeof buf - n, " <color=grey>[</color><color=white>%d</color><color=grey>]</color>", g_page + 1);
     if (f_fps) n += snprintf(buf + n, sizeof buf - n, "<size=16>  %d fps</size>", (int)(g_fps + 0.5f));
+    if (f_speedo) n += snprintf(buf + n, sizeof buf - n, "<size=16>  %.1f m/s</size>", g_speedNow);
     if (f_clock) {
         time_t now = time(nullptr);
         struct tm lt;
@@ -859,6 +934,10 @@ static void Press(Item *it) {
     case OPEN:
         g_cat = it->target;
         g_page = 0;
+        if (it->target == SOUNDS) {
+            ScanSounds();
+            if (g_soundItems.empty()) Notify("Put .mp3 or .wav files in the mods/sounds folder");
+        }
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
@@ -866,6 +945,7 @@ static void Press(Item *it) {
         Notify("[%s] %s", *it->flag ? "ON" : "OFF", it->label);
         break;
     case ACTION:
+        g_pressArg = it->arg;
         if (it->fn) it->fn();
         break;
     }
@@ -1305,6 +1385,18 @@ static void DanceTick(const Buttons &in, float dt) {
         R = shoulder + f * 0.35f + r * 0.2f + Vector3(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f) * 0.3f;
         L = shoulder + f * 0.35f - r * 0.2f + Vector3(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f) * 0.3f;
         break;
+    case 8:   // Bird: both arms flap like wings
+        R = shoulder + r * 0.7f + up * (0.1f + 0.35f * sinf(t * 9));
+        L = shoulder - r * 0.7f + up * (0.1f + 0.35f * sinf(t * 9));
+        break;
+    case 9:   // Clap: hands meet in front of you
+        R = shoulder + f * 0.4f + r * (0.02f + 0.2f * fabsf(sinf(t * 7))) - up * 0.05f;
+        L = shoulder + f * 0.4f - r * (0.02f + 0.2f * fabsf(sinf(t * 7))) - up * 0.05f;
+        break;
+    case 10:  // Boxing: left, then right
+        R = shoulder + f * (0.25f + 0.4f * fmaxf(0.0f, sinf(t * 8))) + r * 0.15f;
+        L = shoulder + f * (0.25f + 0.4f * fmaxf(0.0f, -sinf(t * 8))) - r * 0.15f;
+        break;
     default:  // Beyblade: hands spin fast around your waist
         R = shoulder - up * 0.3f + r * (0.5f * cosf(t * 20)) + f * (0.5f * sinf(t * 20));
         L = shoulder - up * 0.3f - r * (0.5f * cosf(t * 20)) - f * (0.5f * sinf(t * 20));
@@ -1624,36 +1716,99 @@ static void ResetMotionState() {
     g_armsApplied = false;
     g_layoutId = -1;
     g_layoutPart = 0;
+    V2Reset();
 }
 
-// Adds extra to the speed-ups the game just gave you (a push off a wall, a swing, a jump).
-// It never touches slowing down, so you still stop normally. Speed is capped.
-static void Amplify(Vector3 v, float mult, float cap) {
-    Vector3 d = v - g_prevVel;
-    float dm = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
-    if (dm < 1e-4f || dm > 6.0f) return;                     // nothing new, or a teleport / room load
-    float k = mult - 1.0f;
-    Vector3 add(0, d.y > 0 ? d.y * k : 0, 0);                // only a push up, never gravity
-    if (d.x * v.x + d.z * v.z > 0) { add.x = d.x * k; add.z = d.z * k; }   // only speeding up
-    if (add.x == 0 && add.y == 0 && add.z == 0) return;
-    Vector3 nv = v + add;
-    float hs = sqrtf(nv.x * nv.x + nv.z * nv.z);
-    if (hs > cap) { float sc = cap / hs; nv.x *= sc; nv.z *= sc; }
-    if (nv.y > cap) nv.y = cap;
-    SetVel(nv);
+// ---- Prisma V2: speed boost, rope boost, long arms, soundboard, ESP, world -----------------
+// Everything here only changes your own game (and the soundboard plays through your own mic).
+
+static std::string ShortType(const BNM::IL2CPP::Il2CppType *t) {
+    std::string n = TypeName(t);
+    size_t dot = n.rfind('.');
+    return dot == std::string::npos ? n : n.substr(dot + 1);
+}
+static float Len(Vector3 v) { return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z); }
+static Quaternion QInv(Quaternion q) { return Quaternion(-q.x, -q.y, -q.z, q.w); }
+static Vector3 QRot(Quaternion q, Vector3 v) {
+    Vector3 u(q.x, q.y, q.z);
+    Vector3 t = Cross(u, v) * 2.0f;
+    return v + t * q.w + Cross(u, t);
+}
+static Quaternion YawQ(float a) { return Quaternion(0, sinf(a * 0.5f), 0, cosf(a * 0.5f)); }
+
+// ---- Speed Boost -------------------------------------------------------------------
+// Two parts. (1) The game's own jump numbers are raised while it is on (put back when it
+// is off). (2) Whatever way the game moves you, a share of that movement is added again, so
+// you travel faster no matter how the game does it: each frame we look at how far you
+// moved and push you a bit further the same way. We remember where we left you, so our own
+// push is never counted twice. Capped, and off while another movement mod moves you.
+static const float kJumpMult[] = {1.3f, 1.6f, 2.2f};
+static float g_oldJumpSpeed = 0, g_oldJumpMultiplier = 0;
+static Il2CppObject *g_jumpBoosted = nullptr;
+static void JumpFields(bool on) {
+    Il2CppObject *player = g_player.get();
+    if (!player || !G.maxJumpSpeed.IsValid() || !G.jumpMultiplier.IsValid()) return;
+    if (on) {
+        if (g_jumpBoosted != player) {
+            g_oldJumpSpeed = G.maxJumpSpeed[player]();
+            g_oldJumpMultiplier = G.jumpMultiplier[player]();
+            g_jumpBoosted = player;
+        }
+        G.maxJumpSpeed[player] = g_oldJumpSpeed * kJumpMult[g_boostLevel];
+        G.jumpMultiplier[player] = g_oldJumpMultiplier * kJumpMult[g_boostLevel];
+    } else if (g_jumpBoosted == player) {
+        G.maxJumpSpeed[player] = g_oldJumpSpeed;
+        G.jumpMultiplier[player] = g_oldJumpMultiplier;
+        g_jumpBoosted = nullptr;
+    }
+}
+static void SpeedBoostTick(const Buttons &in, float dt) {
+    JumpFields(f_speedBoost);
+    Il2CppObject *t = PlayerTransform();
+    if (!f_speedBoost || !t || dt <= 0) { g_havePrevVel = false; return; }
+    Vector3 cur = G.trGetPosition[t]();                      // g_prevVel = where we left you last frame
+    bool other = (in.a && (f_fly || f_car || f_velocityFly || f_ironMan)) || (in.x && f_ironMan) ||
+                 (f_noclip && in.rtrig) || g_onRope || g_dancing;
+    if (g_havePrevVel && !other) {
+        Vector3 d = cur - g_prevVel;
+        float h = sqrtf(d.x * d.x + d.z * d.z), speed = h / dt;
+        if (speed > 0.3f && speed < 20.0f) {                 // real movement, not a teleport or a room load
+            float k = kBoostMult[g_boostLevel] - 1.0f;
+            float cap = kBoostCap[g_boostLevel];
+            float extra = fminf(h * k, 0.25f);               // at most 25 cm extra in one frame
+            if ((h + extra) / dt > cap) extra = fmaxf(0.0f, cap * dt - h);
+            Vector3 nv = cur + Vector3(d.x / h * extra, 0, d.z / h * extra);
+            if (d.y > 0 && d.y / dt < 12.0f) nv.y += fminf(d.y * k, 0.1f);   // a jump goes higher too
+            G.trSetPosition[t](nv);
+            cur = nv;
+        }
+    }
+    g_prevVel = cur;
+    g_havePrevVel = true;
 }
 
-static void SpeedBoostTick(const Buttons &in) {
-    if (!f_speedBoost || g_onRope || !g_havePrevVel) return;
-    bool own = (in.a && (f_fly || f_car || f_velocityFly || f_ironMan)) || (in.x && f_ironMan) || (f_noclip && in.rtrig);
-    Vector3 v;
-    if (own || !GetVel(v)) return;
-    Amplify(v, kBoostMult[g_boostLevel], kBoostCap[g_boostLevel]);
+// ---- speedometer (shown in the menu title) ------------------------------------------
+static Vector3 g_speedoPrev;
+static bool g_speedoHave = false;
+static void SpeedoTick(float dt) {
+    Il2CppObject *t = PlayerTransform();
+    if (!f_speedo || !t || dt <= 0) { g_speedoHave = false; return; }
+    Vector3 p = G.trGetPosition[t]();
+    if (g_speedoHave) {
+        float s = Len(p - g_speedoPrev) / dt;
+        g_speedNow += (s - g_speedNow) * fminf(1.0f, dt * 6.0f);
+    }
+    g_speedoPrev = p;
+    g_speedoHave = true;
 }
 
-// Rope Boost: while a grip is held with the hand on something called a rope (or a vine),
-// the speed-ups you get are multiplied, so you swing a lot farther. A small physics query
-// ten times a second, only while a grip is held.
+// ---- Rope Boost ----------------------------------------------------------------------
+// A rope is found without knowing the game's rope code: the thing your hand grips is a rope
+// if it (or something above it) has "rope" or "vine" in its name, or if it hangs on a
+// physics joint (ropes and chains are made of joints). While a grip is held on one, your
+// swing is pumped: the speed you already have keeps growing, up to a cap. If the game
+// moves you along the rope by position instead of speed, that movement is stretched
+// instead. A small physics query ten times a second, only while a grip is held.
 static bool NameHasRope(Il2CppObject *comp) {
     Il2CppObject *t = G.compTransform[comp]();
     for (int up = 0; up < 4 && t; up++, t = G.trGetParent.IsValid() ? G.trGetParent[t]() : nullptr) {
@@ -1669,45 +1824,174 @@ static bool NameHasRope(Il2CppObject *comp) {
     }
     return false;
 }
+static bool RopeLike(Il2CppObject *c) {
+    if (NameHasRope(c)) return true;
+    if (!G.colAttachedRb.IsValid() || !G.tJoint) return false;
+    Il2CppObject *rb = G.colAttachedRb[c]();
+    if (!Alive(rb) || rb == g_rigidbody.get()) return false;         // never your own body
+    Il2CppObject *go = G.compGameObject[rb]();
+    Il2CppObject *joint = go ? G.goGetComponent[go]((Il2CppObject *)G.tJoint) : nullptr;
+    if (!Alive(joint)) return false;
+    if (!g_ropeLogged) { g_ropeLogged = true; ym::log("prisma: rope-like object found (hangs on a joint)"); }
+    return true;
+}
 static bool HandOnRope(Il2CppObject *hand) {
-    auto *arr = (uint8_t *)G.overlapSphere(G.trGetPosition[hand](), 0.2f);
+    auto *arr = (uint8_t *)G.overlapSphere(G.trGetPosition[hand](), 0.25f);
     size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
     for (size_t i = 0; i < n && i < 16; i++) {
         Il2CppObject *c = ((Il2CppObject **)(arr + 0x20))[i];
-        if (Alive(c) && NameHasRope(c)) return true;
+        if (Alive(c) && RopeLike(c)) return true;
     }
     return false;
 }
-static void RopeTick(const Buttons &in) {
-    if (!f_rope || !G.overlapSphere.IsValid() || !G.objGetName.IsValid() || !G.compGameObject.IsValid() ||
+static Vector3 g_ropePrevPos;
+static bool g_ropeHavePos = false;
+static void RopeTick(const Buttons &in, float dt) {
+    Il2CppObject *t = PlayerTransform();
+    if (!f_rope || !t || dt <= 0 || !G.overlapSphere.IsValid() || !G.objGetName.IsValid() ||
         !(in.lgrip || in.rgrip) || !g_leftHand.get() || !g_rightHand.get()) {
         g_onRope = false;
+        g_ropeHavePos = false;
         return;
     }
     if (g_time >= g_nextRopeCheck) {
         g_nextRopeCheck = g_time + 0.1;
         g_onRope = (in.lgrip && HandOnRope(g_leftHand.get())) || (in.rgrip && HandOnRope(g_rightHand.get()));
     }
-    Vector3 v;
-    if (!g_onRope || !g_havePrevVel || !GetVel(v)) return;
-    Amplify(v, kRopeMult[g_ropePower], 25.0f);
+    if (!g_onRope) { g_ropeHavePos = false; return; }
+    float k = (kRopeMult[g_ropePower] - 1.0f) * 0.6f;
+    Vector3 pos = G.trGetPosition[t](), v;
+    if (GetVel(v) && Len(v) > 0.5f) {
+        Vector3 nv = v * (1.0f + k * dt);
+        float l = Len(nv);
+        if (l > 22.0f) nv = nv * (22.0f / l);
+        SetVel(nv);
+    } else if (g_ropeHavePos) {
+        Vector3 d = pos - g_ropePrevPos;
+        float sp = Len(d) / dt;
+        if (sp > 0.5f && sp < 15.0f) { pos = pos + d * (k * dt * 4.0f); G.trSetPosition[t](pos); }
+    }
+    g_ropePrevPos = pos;
+    g_ropeHavePos = true;
 }
 
-// Long Arms: your hands are moved away from your shoulders by a fixed share (+20% by
-// default). The controllers put your hands back every frame, so nothing builds up; if they
-// ever stop doing that, the last real position is kept so the arms can't keep growing.
-static void ArmsTick() {
-    Il2CppObject *head = g_head.get(), *lh = g_leftHand.get(), *rh = g_rightHand.get();
-    if (!head || !lh || !rh || g_dancing) { g_armsHave = false; g_armsApplied = false; return; }
-    if (!f_longArms) {
-        if (g_armsApplied && g_armsHave) {                   // switched off: hands go back
-            G.trSetPosition[lh](g_trueL);
-            G.trSetPosition[rh](g_trueR);
+// ---- Long Arms, three ways ------------------------------------------------------------
+// 0 = the game's own arm-length number, if the player has one (found by name, once);
+// 1 = tracker: your hands are driven from the controllers' real positions, so nothing can
+//     put them back (the same way the dances move your hands);
+// 2 = simple: the hands are pushed out each frame after the game placed them.
+// Auto picks 0 when the number exists, otherwise 1, and falls back to 2 if 1 fails.
+static int g_armMethod = 0;
+static const char *kArmMethodName[] = {"auto", "tracker", "simple"};
+static void NextArmMethod() {
+    g_armMethod = (g_armMethod + 1) % 3;
+    g_trackerBad = false;
+    Notify("Arm method: %s", kArmMethodName[g_armMethod]);
+}
+
+static Field<float> g_armFieldF;
+static bool g_armFieldOk = false, g_armFieldSearched = false;
+static float g_armOrig = 0;
+static Il2CppObject *g_armFieldPlayer = nullptr;
+static bool FindArmField() {
+    if (g_armFieldSearched) return g_armFieldOk;
+    g_armFieldSearched = true;
+    Class player("", "MasterPlayer", Image("Assembly-CSharp.dll"));
+    if (!player.IsValid()) return false;
+    for (auto &f : player.GetFields(true)) {
+        auto *fi = f.GetInfo();
+        if (!fi || !fi->name || ShortType(fi->type) != "Single") continue;
+        std::string n = fi->name, low = n;
+        for (auto &ch : low) ch = (char)tolower((unsigned char)ch);
+        bool arm = (n.compare(0, 3, "arm") == 0 || n.find("Arm") != std::string::npos || n.find("_arm") != std::string::npos) &&
+                   low.find("armor") == std::string::npos && low.find("army") == std::string::npos;
+        bool size = low.find("length") != std::string::npos || low.find("reach") != std::string::npos ||
+                    low.find("scale") != std::string::npos || low.find("extend") != std::string::npos ||
+                    low.find("size") != std::string::npos || low.find("mult") != std::string::npos;
+        if (arm && size) {
+            g_armFieldF = f;
+            g_armFieldOk = true;
+            ym::log("prisma: long arms: using the game's own number %s", fi->name);
+            break;
         }
-        g_armsApplied = false;
-        g_armsHave = false;
-        return;
     }
+    return g_armFieldOk;
+}
+static void ArmsFieldTick(bool on) {
+    Il2CppObject *player = g_player.get();
+    if (!g_armFieldOk || !player) return;
+    if (on) {
+        if (g_armFieldPlayer != player) { g_armOrig = g_armFieldF[player](); g_armFieldPlayer = player; }
+        if (g_armOrig > 0.001f) g_armFieldF[player] = g_armOrig * (1.0f + kArmBoost[g_armLevel]);
+    } else if (g_armFieldPlayer == player) {
+        g_armFieldF[player] = g_armOrig;
+        g_armFieldPlayer = nullptr;
+    }
+}
+
+static Ref g_usePos, g_useRot;
+static bool ReadPose(int node, Vector3 &p, Quaternion &q) {
+    XRDevice d = G.deviceAtNode(node);
+    if (!d.initialized || !G.tryGetVec3.IsValid() || !G.tryGetQuat.IsValid()) return false;
+    if (!g_usePos.get()) {
+        g_usePos.set((Il2CppObject *)CreateMonoString("DevicePosition"));
+        g_useRot.set((Il2CppObject *)CreateMonoString("DeviceRotation"));
+    }
+    bool a = G.tryGetVec3(d.id, (BNM::Structures::Mono::String *)g_usePos.get(), &p);
+    bool b = G.tryGetQuat(d.id, (BNM::Structures::Mono::String *)g_useRot.get(), &q);
+    return a && b;
+}
+struct HandCal { Vector3 pOff = Vector3(0, 0, 0); Quaternion qOff = Quaternion(0, 0, 0, 1); };
+static HandCal g_cal[2];
+static void TrackerFail(const char *why) {
+    g_trackerBad = true;
+    if (g_armsTracker && !g_dancing) PauseTrackers(false);
+    g_armsTracker = false;
+    ym::log("prisma: long arms tracker mode failed: %s", why);
+    Notify("Long Arms: using the simple way");
+}
+static void ArmsTrackerTick() {
+    Il2CppObject *head = g_head.get(), *hands[2] = {g_leftHand.get(), g_rightHand.get()};
+    Vector3 headDevP(0, 0, 0), headW = G.trGetPosition[head]();
+    Quaternion hq(0, 0, 0, 1);
+    if (!ReadPose(3, headDevP, hq)) { TrackerFail("controller data unavailable"); return; }
+    Vector3 fw = G.trGetForward[head](), fd = QRot(hq, Vector3(0, 0, 1));
+    if (fw.x * fw.x + fw.z * fw.z < 0.01f || fd.x * fd.x + fd.z * fd.z < 0.01f) return;   // looking straight up or down
+    Quaternion yawQ = YawQ(atan2f(fw.x, fw.z) - atan2f(fd.x, fd.z));
+    Vector3 pred[2] = {Vector3(0, 0, 0), Vector3(0, 0, 0)};
+    Quaternion devW[2] = {Quaternion(0, 0, 0, 1), Quaternion(0, 0, 0, 1)};
+    for (int i = 0; i < 2; i++) {
+        Vector3 p(0, 0, 0);
+        Quaternion q(0, 0, 0, 1);
+        if (!ReadPose(i == 0 ? 4 : 5, p, q)) { TrackerFail("controller data unavailable"); return; }
+        devW[i] = yawQ * q;
+        pred[i] = headW + QRot(yawQ, p - headDevP);
+    }
+    if (!g_armsTracker) {                                    // first frame: learn how the hand sits on the controller
+        for (int i = 0; i < 2; i++) {
+            Vector3 off = G.trGetPosition[hands[i]]() - pred[i];
+            if (Len(off) > 0.6f) { TrackerFail("controller position does not match the hand"); return; }
+            g_cal[i].pOff = QRot(QInv(devW[i]), off);
+            g_cal[i].qOff = QInv(devW[i]) * G.trGetRotation[hands[i]]();
+        }
+        PauseTrackers(true);
+        g_armsTracker = true;
+        ym::log("prisma: long arms: tracker mode on");
+    }
+    Vector3 up(0, 1, 0), f = Flat(G.trGetForward[head]()), r = Cross(up, f);
+    float s = 1.0f + kArmBoost[g_armLevel];
+    for (int i = 0; i < 2; i++) {
+        Vector3 truePos = pred[i] + QRot(devW[i], g_cal[i].pOff);
+        Vector3 sh = headW + up * -0.25f + r * (i == 0 ? -0.18f : 0.18f);
+        Vector3 out = sh + (truePos - sh) * s;
+        if (Len(out - headW) > 1.8f) { TrackerFail("hand ended up too far away"); return; }
+        G.trSetPosition[hands[i]](out);
+        G.trSetRotation[hands[i]](devW[i] * g_cal[i].qOff);
+    }
+}
+
+static void ArmsSimpleTick() {
+    Il2CppObject *head = g_head.get(), *lh = g_leftHand.get(), *rh = g_rightHand.get();
     Vector3 hp = G.trGetPosition[head](), f = Flat(G.trGetForward[head]()), up(0, 1, 0);
     Vector3 r = Cross(up, f);
     Vector3 shL = hp + up * -0.25f - r * 0.18f, shR = hp + up * -0.25f + r * 0.18f;
@@ -1726,12 +2010,485 @@ static void ArmsTick() {
     g_armsHave = true;
     g_armsApplied = true;
 }
+static void ArmsSimpleOff() {
+    Il2CppObject *lh = g_leftHand.get(), *rh = g_rightHand.get();
+    if (g_armsApplied && g_armsHave && !g_dancing && Alive(lh) && Alive(rh)) {
+        G.trSetPosition[lh](g_trueL);
+        G.trSetPosition[rh](g_trueR);
+    }
+    g_armsApplied = false;
+    g_armsHave = false;
+}
 
-// Called last every frame: what the game and the other mods left your speed at.
-static void RecordVelocity() {
-    Vector3 v;
-    if ((f_speedBoost || f_rope) && GetVel(v)) { g_prevVel = v; g_havePrevVel = true; }
-    else g_havePrevVel = false;
+static int g_armActive = -1;                                 // which way is running: 0, 1, 2 or -1 = off
+static void ArmsCleanup(int m) {
+    if (m == 0) ArmsFieldTick(false);
+    else if (m == 1) {
+        if (g_armsTracker && !g_dancing) PauseTrackers(false);
+        g_armsTracker = false;
+    } else if (m == 2) ArmsSimpleOff();
+}
+static void ArmsTick() {
+    int eff = -1;
+    if (f_longArms && !g_dancing && g_head.get() && g_leftHand.get() && g_rightHand.get()) {
+        int m = g_armMethod;
+        if (m == 0) m = FindArmField() ? 0 : 1;
+        if (m == 1 && g_trackerBad) m = 2;
+        eff = m;
+    }
+    if (eff != g_armActive) { ArmsCleanup(g_armActive); g_armActive = eff; }
+    if (eff == 0) ArmsFieldTick(true);
+    else if (eff == 1) ArmsTrackerTick();
+    else if (eff == 2) ArmsSimpleTick();
+}
+
+// ---- Soundboard ------------------------------------------------------------------------
+// Put .mp3 or .wav files in a folder called "sounds" inside the mods folder (loose files in
+// the mods folder work too). Pick one in the Soundboard page and it plays through your own
+// microphone channel, so the room hears it like a real soundboard. Owner rules (AGENTS.md):
+// one sound at a time; the button stays locked until the sound has finished, and never
+// under 1 second; normal voice volume (no gain, no looping, no stacking); 30 s at most.
+// The file is read, decoded and loaded a little each frame so the game never stalls.
+static std::vector<std::string> g_soundFiles, g_soundLabels;
+static constexpr int kMaxSounds = 40;
+static constexpr size_t kMaxSoundFile = 20u * 1024 * 1024;
+static constexpr float kMaxSoundSeconds = 30.0f;
+
+enum SndState { SND_IDLE, SND_READ, SND_DECODE, SND_MAKE, SND_START, SND_PLAY };
+static struct {
+    SndState st = SND_IDLE;
+    FILE *fp = nullptr;
+    size_t size = 0, pos = 0, wavEnd = 0;
+    bool isWav = false, saved = false, oldLoop = false;
+    int hz = 0, ch = 1, oldSource = 0;
+    std::vector<uint8_t> file;
+    std::vector<float> pcm;
+    mp3dec_t dec;
+    double busyUntil = 0, endAt = 0;
+    float seconds = 0;
+    Ref clip, recorder, oldClip;
+} g_snd;
+
+static struct {
+    bool tried = false, ok = false, restartHasArg = false;
+    Method<Il2CppObject *> clipCreate, recGetClip;
+    Method<bool> clipSetData, recGetLoop;
+    Method<void> recSetSource, recSetClip, recSetLoop, recRestart;
+    Method<int> recGetSource;
+    BNM::MonoType *tRecorder = nullptr;
+    BNM::IL2CPP::Il2CppClass *floatClass = nullptr;
+} g_vox;
+
+static bool VoiceLookups() {
+    if (g_vox.tried) return g_vox.ok;
+    g_vox.tried = true;
+    Class rec("Photon.Voice.Unity", "Recorder"), clip("UnityEngine", "AudioClip");
+    if (!rec.IsValid() || !clip.IsValid()) { ym::log("prisma: voice classes missing (recorder %d, clip %d)", rec.IsValid(), clip.IsValid()); return false; }
+    g_vox.tRecorder = rec.GetMonoType();
+    g_vox.recSetSource = rec.GetMethod("set_SourceType", 1);
+    g_vox.recGetSource = rec.GetMethod("get_SourceType", 0);
+    g_vox.recSetClip = rec.GetMethod("set_AudioClip", 1);
+    g_vox.recGetClip = rec.GetMethod("get_AudioClip", 0);
+    g_vox.recSetLoop = rec.GetMethod("set_LoopAudioClip", 1);
+    g_vox.recGetLoop = rec.GetMethod("get_LoopAudioClip", 0);
+    g_vox.recRestart = rec.GetMethod("RestartRecording", 1);
+    g_vox.restartHasArg = g_vox.recRestart.IsValid();
+    if (!g_vox.restartHasArg) g_vox.recRestart = rec.GetMethod("RestartRecording", 0);
+    g_vox.clipCreate = clip.GetMethod("Create", 5);
+    g_vox.clipSetData = clip.GetMethod("SetData", 2);
+    g_vox.floatClass = Class("System", "Single").GetClass();
+    g_vox.ok = g_vox.tRecorder && g_vox.recSetSource.IsValid() && g_vox.recGetSource.IsValid() && g_vox.recSetClip.IsValid() &&
+               g_vox.recGetClip.IsValid() && g_vox.recSetLoop.IsValid() && g_vox.recGetLoop.IsValid() &&
+               g_vox.recRestart.IsValid() && g_vox.clipCreate.IsValid() && g_vox.clipSetData.IsValid() &&
+               g_vox.floatClass && G.arrayNew && (G.findScene.IsValid() || G.findSceneByType.IsValid());
+    ym::log("prisma: voice lookups ok=%d (source %d/%d, clip %d/%d, loop %d/%d, restart %d, create %d, setdata %d)", g_vox.ok,
+            g_vox.recSetSource.IsValid(), g_vox.recGetSource.IsValid(), g_vox.recSetClip.IsValid(), g_vox.recGetClip.IsValid(),
+            g_vox.recSetLoop.IsValid(), g_vox.recGetLoop.IsValid(), g_vox.recRestart.IsValid(), g_vox.clipCreate.IsValid(),
+            g_vox.clipSetData.IsValid());
+    return g_vox.ok;
+}
+static Il2CppObject *FindRecorder() {
+    Il2CppObject *r = g_snd.recorder.get();
+    if (Alive(r)) return r;
+    if (!g_vox.tRecorder) return nullptr;
+    auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)g_vox.tRecorder)
+                                                  : G.findSceneByType((Il2CppObject *)g_vox.tRecorder, 0));
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    if (n == 0) return nullptr;
+    Il2CppObject *best = ((Il2CppObject **)(arr + 0x20))[0];
+    g_snd.recorder.set(best);
+    return best;
+}
+
+static void SoundClear() {
+    if (g_snd.fp) { fclose(g_snd.fp); g_snd.fp = nullptr; }
+    std::vector<uint8_t>().swap(g_snd.file);
+    std::vector<float>().swap(g_snd.pcm);
+}
+static void SoundRestore() {                                 // give the microphone back
+    Il2CppObject *rec = g_snd.recorder.get();
+    if (g_snd.saved && Alive(rec)) {
+        try {
+            g_vox.recSetLoop[rec](g_snd.oldLoop);
+            g_vox.recSetClip[rec](g_snd.oldClip.get());
+            g_vox.recSetSource[rec](g_snd.oldSource);
+            if (g_vox.restartHasArg) g_vox.recRestart[rec](true); else g_vox.recRestart[rec]();
+        } catch (...) { ym::log("prisma: sound: restore error"); }
+    }
+    g_snd.saved = false;
+    g_snd.oldClip.clear();
+    Kill(g_snd.clip);
+}
+static void SoundFail(const char *msg) {
+    SoundClear();
+    g_snd.st = SND_IDLE;
+    g_snd.busyUntil = g_time + 1.0;
+    Notify("%s", msg);
+    ym::log("prisma: sound: %s", msg);
+}
+static void SoundAbort() {
+    SoundClear();
+    if (g_snd.st != SND_IDLE || g_snd.saved) SoundRestore();
+    g_snd.st = SND_IDLE;
+    g_snd.recorder.clear();
+}
+
+static uint32_t Le32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint16_t Le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static bool WavInit() {                                      // 16-bit PCM only
+    const uint8_t *d = g_snd.file.data();
+    size_t n = g_snd.file.size(), pos = 12, start = 0, end = 0;
+    if (n < 44 || memcmp(d, "RIFF", 4) != 0 || memcmp(d + 8, "WAVE", 4) != 0) return false;
+    int fmt = 0, ch = 0, bits = 0, hz = 0;
+    while (pos + 8 <= n) {
+        uint32_t sz = Le32(d + pos + 4);
+        if (memcmp(d + pos, "fmt ", 4) == 0 && pos + 24 <= n) {
+            fmt = Le16(d + pos + 8); ch = Le16(d + pos + 10); hz = (int)Le32(d + pos + 12); bits = Le16(d + pos + 22);
+        } else if (memcmp(d + pos, "data", 4) == 0) {
+            start = pos + 8;
+            end = std::min<size_t>(n, start + sz);
+            break;
+        }
+        pos += 8 + (size_t)sz + (sz & 1);
+    }
+    if (fmt != 1 || bits != 16 || ch < 1 || ch > 2 || hz < 8000 || start == 0) return false;
+    g_snd.hz = hz; g_snd.ch = ch; g_snd.pos = start; g_snd.wavEnd = end;
+    return true;
+}
+
+static void SoundPlay(int idx) {
+    if (idx < 0 || idx >= (int)g_soundFiles.size()) return;
+    if (g_snd.st != SND_IDLE || g_time < g_snd.busyUntil) { Notify("Wait for the sound to finish"); return; }
+    if (!VoiceLookups()) { Notify("Voice chat not found in this game"); return; }
+    const std::string &path = g_soundFiles[idx];
+    FILE *fp = fopen(path.c_str(), "rb");
+    if (!fp) { Notify("Could not open that file"); return; }
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (len < 100 || (size_t)len > kMaxSoundFile) {
+        fclose(fp);
+        Notify(len < 100 ? "That file is empty" : "File too big (20 MB max)");
+        return;
+    }
+    g_snd.fp = fp;
+    g_snd.size = (size_t)len;
+    g_snd.file.clear();
+    g_snd.file.reserve(g_snd.size);
+    g_snd.pcm.clear();
+    g_snd.pos = 0;
+    g_snd.hz = 0;
+    std::string low = path;
+    for (auto &c : low) c = (char)tolower((unsigned char)c);
+    g_snd.isWav = low.size() > 4 && low.compare(low.size() - 4, 4, ".wav") == 0;
+    g_snd.st = SND_READ;
+    g_snd.busyUntil = g_time + 1.0;
+    Notify("Loading sound...");
+}
+
+static void SoundTick() {
+    if (g_snd.st == SND_IDLE) return;
+    try {
+        switch (g_snd.st) {
+        case SND_READ: {                                     // 512 KB a frame
+            size_t have = g_snd.file.size(), want = std::min<size_t>(512 * 1024, g_snd.size - have);
+            g_snd.file.resize(have + want);
+            size_t got = fread(g_snd.file.data() + have, 1, want, g_snd.fp);
+            if (got < want) { g_snd.file.resize(have + got); g_snd.size = g_snd.file.size(); }
+            if (g_snd.file.size() >= g_snd.size) {
+                fclose(g_snd.fp);
+                g_snd.fp = nullptr;
+                g_snd.pos = 0;
+                if (g_snd.isWav) {
+                    if (!WavInit()) { SoundFail("Only 16-bit .wav files work"); break; }
+                } else mp3dec_init(&g_snd.dec);
+                g_snd.pcm.reserve(48000 * (size_t)kMaxSoundSeconds + 4096);
+                g_snd.st = SND_DECODE;
+            }
+            break;
+        }
+        case SND_DECODE: {                                   // at most about 1.5 ms of decoding a frame
+            auto t0 = std::chrono::steady_clock::now();
+            auto slow = [&]() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > 1.5; };
+            bool done = false;
+            if (g_snd.isWav) {
+                while (g_snd.pos + 2 * g_snd.ch <= g_snd.wavEnd && !slow()) {
+                    for (int n = 0; n < 2048 && g_snd.pos + 2 * g_snd.ch <= g_snd.wavEnd; n++) {
+                        float acc = 0;
+                        for (int c = 0; c < g_snd.ch; c++) {
+                            int16_t v;
+                            memcpy(&v, g_snd.file.data() + g_snd.pos, 2);
+                            g_snd.pos += 2;
+                            acc += v;
+                        }
+                        g_snd.pcm.push_back(acc / g_snd.ch / 32768.0f);
+                    }
+                }
+                done = g_snd.pos + 2 * g_snd.ch > g_snd.wavEnd;
+            } else {
+                static mp3d_sample_t buf[MINIMP3_MAX_SAMPLES_PER_FRAME];
+                mp3dec_frame_info_t info;
+                while (!slow()) {
+                    if (g_snd.pos >= g_snd.file.size()) { done = true; break; }
+                    int n = mp3dec_decode_frame(&g_snd.dec, g_snd.file.data() + g_snd.pos, (int)(g_snd.file.size() - g_snd.pos), buf, &info);
+                    if (info.frame_bytes <= 0) { done = true; break; }
+                    g_snd.pos += info.frame_bytes;
+                    if (n > 0 && info.channels > 0) {
+                        g_snd.hz = info.hz;
+                        for (int i = 0; i < n; i++) {
+                            float acc = 0;
+                            for (int c = 0; c < info.channels; c++) acc += buf[i * info.channels + c];
+                            g_snd.pcm.push_back(acc / info.channels / 32768.0f);
+                        }
+                    }
+                    if (g_snd.hz > 0 && g_snd.pcm.size() > (size_t)(g_snd.hz * kMaxSoundSeconds)) break;
+                }
+            }
+            if (g_snd.hz > 0 && g_snd.pcm.size() > (size_t)(g_snd.hz * kMaxSoundSeconds)) { SoundFail("Sound is too long (30 s max)"); break; }
+            if (done) {
+                if (g_snd.hz <= 0 || g_snd.pcm.size() < (size_t)g_snd.hz / 10) { SoundFail("Could not read that sound"); break; }
+                std::vector<uint8_t>().swap(g_snd.file);
+                g_snd.st = SND_MAKE;
+            }
+            break;
+        }
+        case SND_MAKE: {                                     // the samples become a Unity AudioClip
+            Il2CppObject *rec = FindRecorder();
+            if (!rec) { SoundFail("Voice recorder not found"); break; }
+            size_t n = g_snd.pcm.size();
+            auto *arr = (uint8_t *)G.arrayNew((void *)g_vox.floatClass, (uintptr_t)n);
+            if (!arr) { SoundFail("Out of memory"); break; }
+            memcpy(arr + 0x20, g_snd.pcm.data(), n * sizeof(float));
+            Il2CppObject *clip = g_vox.clipCreate(CreateMonoString("prisma"), (int)n, 1, g_snd.hz, false);
+            if (!clip) { SoundFail("Could not make the sound"); break; }
+            g_vox.clipSetData[clip]((Il2CppObject *)arr, 0);
+            g_snd.clip.set(clip);
+            g_snd.seconds = (float)n / (float)g_snd.hz;
+            std::vector<float>().swap(g_snd.pcm);
+            g_snd.st = SND_START;
+            break;
+        }
+        case SND_START: {                                    // the recorder reads the clip instead of the mic
+            Il2CppObject *rec = FindRecorder();
+            if (!rec || !Alive(g_snd.clip.get())) { SoundFail("Voice recorder not found"); break; }
+            g_snd.oldSource = g_vox.recGetSource[rec]();
+            g_snd.oldClip.set(g_vox.recGetClip[rec]());
+            g_snd.oldLoop = g_vox.recGetLoop[rec]();
+            g_snd.saved = true;
+            g_vox.recSetLoop[rec](false);
+            g_vox.recSetClip[rec](g_snd.clip.get());
+            g_vox.recSetSource[rec](1);                      // Recorder.InputSourceType.AudioClip
+            if (g_vox.restartHasArg) g_vox.recRestart[rec](true); else g_vox.recRestart[rec]();
+            g_snd.endAt = g_time + fmaxf(g_snd.seconds, 1.0f) + 0.5f;
+            g_snd.busyUntil = g_snd.endAt;                   // locked until it has finished
+            g_snd.st = SND_PLAY;
+            Notify("Playing (%d s)", (int)(g_snd.seconds + 0.5f));
+            break;
+        }
+        case SND_PLAY:
+            if (g_time >= g_snd.endAt) { SoundRestore(); g_snd.st = SND_IDLE; }
+            break;
+        default: break;
+        }
+    } catch (...) {
+        SoundFail("Sound error");
+        SoundRestore();
+    }
+}
+
+static void PlaySoundPressed() { SoundPlay(g_pressArg); }
+static void ScanSounds() {
+    g_soundFiles.clear();
+    g_soundLabels.clear();
+    g_soundItems.clear();
+    const char *mods = ym::api()->modsDir;
+    if (!mods) return;
+    std::string base = mods;
+    auto ends = [](const std::string &n, const char *e) {
+        size_t l = strlen(e);
+        if (n.size() < l) return false;
+        for (size_t i = 0; i < l; i++) if (tolower((unsigned char)n[n.size() - l + i]) != e[i]) return false;
+        return true;
+    };
+    std::vector<std::pair<std::string, std::string>> found;      // label, path
+    for (std::string dir : {base + "/sounds", base}) {
+        DIR *d = opendir(dir.c_str());
+        if (!d) continue;
+        while (struct dirent *e = readdir(d)) {
+            std::string n = e->d_name;
+            if (n.empty() || n[0] == '.' || !(ends(n, ".mp3") || ends(n, ".wav"))) continue;
+            std::string label = n.substr(0, n.size() - 4);
+            if (label.size() > 22) label.resize(22);
+            if (found.size() < (size_t)kMaxSounds) found.push_back({label, dir + "/" + n});
+        }
+        closedir(d);
+    }
+    std::sort(found.begin(), found.end());
+    for (auto &f : found) { g_soundLabels.push_back(f.first); g_soundFiles.push_back(f.second); }
+    g_soundItems.reserve(kMaxSounds);
+    for (size_t i = 0; i < g_soundLabels.size(); i++)
+        g_soundItems.push_back(Item{SOUNDS, g_soundLabels[i].c_str(), ACTION, MAIN, nullptr, PlaySoundPressed, (int)i});
+}
+
+// ---- ESP (only you see it) ------------------------------------------------------------
+// A box and a line to every other player, drawn with the same line objects the teleport
+// gun uses. Other players are found with one scene search every two seconds. Nothing is sent.
+static constexpr int kEspMax = 12;
+static BNM::MonoType *g_tMasterPlayer = nullptr;
+static Ref g_espShader;
+static bool g_espZ = false, g_espShaderTried = false;
+static Ref g_espBoxGo[kEspMax], g_espBox[kEspMax], g_espTrGo[kEspMax], g_espTr[kEspMax], g_espTarget[kEspMax];
+static int g_espN = 0;
+static double g_nextEspScan = 0, g_espSaid = 0;
+
+static void EspReset() {
+    for (int i = 0; i < kEspMax; i++) {
+        Kill(g_espBoxGo[i]); g_espBox[i].clear();
+        Kill(g_espTrGo[i]); g_espTr[i].clear();
+        g_espTarget[i].clear();
+    }
+    g_espN = 0;
+    g_nextEspScan = 0;
+}
+static bool MakeEspLine(Ref &goOut, Ref &lrOut, int count, float width, Color c) {
+    Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("PrismaEsp"));
+    Il2CppObject *line = lineGo && G.tLine ? G.goAddComponent[lineGo](G.tLine) : nullptr;
+    if (!line) return false;
+    if (Il2CppObject *m = G.rendererGetMaterial[line]()) {
+        Il2CppObject *sh = g_espShader.get() ? g_espShader.get() : G.shader.get();
+        if (sh) G.matSetShader[m](sh);
+        G.matSetColor[m](c);
+        if (g_espZ && G.matSetInt.IsValid()) G.matSetInt[m](CreateMonoString("_ZTest"), 8);   // always on top, through walls
+    }
+    G.lrSetStartWidth[line](width);
+    G.lrSetEndWidth[line](width);
+    G.lrSetPositionCount[line](count);
+    G.lrSetUseWorldSpace[line](true);
+    goOut.set(lineGo);
+    lrOut.set(line);
+    return true;
+}
+static void EspTick() {
+    static bool wasOn = false;
+    if (!f_esp) {
+        if (wasOn) { for (int i = 0; i < kEspMax; i++) { Show(g_espBoxGo[i], false); Show(g_espTrGo[i], false); } wasOn = false; }
+        return;
+    }
+    wasOn = true;
+    if (!G.lrSetPosition.IsValid() || !G.headTransform.IsValid()) return;
+    if (!g_espShaderTried) {
+        g_espShaderTried = true;
+        const char *names[] = {"Hidden/Internal-Colored", "GUI/Text Shader", "Sprites/Default"};
+        for (int i = 0; i < 3 && !g_espShader.get() && G.shaderFind.IsValid(); i++) {
+            Il2CppObject *sh = G.shaderFind((BNM::Structures::Mono::String *)CreateMonoString(names[i]));
+            if (Alive(sh)) { g_espShader.set(sh); g_espZ = (i == 0); }
+        }
+        ym::log("prisma: esp shader %s", g_espShader.get() ? (g_espZ ? "see-through" : "plain") : "default");
+    }
+    if (!g_tMasterPlayer) {
+        Class mp("", "MasterPlayer", Image("Assembly-CSharp.dll"));
+        if (mp.IsValid()) g_tMasterPlayer = mp.GetMonoType();
+    }
+    if (!g_tMasterPlayer || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return;
+    if (g_time >= g_nextEspScan) {
+        g_nextEspScan = g_time + 2.0;
+        auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)g_tMasterPlayer)
+                                                      : G.findSceneByType((Il2CppObject *)g_tMasterPlayer, 0));
+        size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+        int k = 0;
+        for (size_t i = 0; i < n && k < kEspMax; i++) {
+            Il2CppObject *p = ((Il2CppObject **)(arr + 0x20))[i];
+            if (Alive(p) && p != g_player.get()) g_espTarget[k++].set(p);
+        }
+        for (int i = k; i < kEspMax; i++) g_espTarget[i].clear();
+        g_espN = k;
+        if (k == 0 && g_time - g_espSaid > 8.0) { g_espSaid = g_time; Notify("ESP: nobody else found"); }
+    }
+    Il2CppObject *rh = g_rightHand.get();
+    for (int i = 0; i < kEspMax; i++) {
+        Il2CppObject *p = g_espTarget[i].get();
+        if (i >= g_espN || !Alive(p)) { Show(g_espBoxGo[i], false); Show(g_espTrGo[i], false); continue; }
+        Il2CppObject *ht = G.headTransform[p]();
+        Vector3 head = Alive(ht) ? G.trGetPosition[ht]() : G.trGetPosition[G.compTransform[p]()]() + Vector3(0, 1.6f, 0);
+        if (!g_espBox[i].get() && !MakeEspLine(g_espBoxGo[i], g_espBox[i], 16, 0.015f, T().title)) continue;
+        Show(g_espBoxGo[i], true);
+        const float w = 0.3f, cx[4] = {-w, w, w, -w}, cz[4] = {-w, -w, w, w};
+        Vector3 b[4], t[4];
+        for (int k = 0; k < 4; k++) {
+            b[k] = Vector3(head.x + cx[k], head.y - 1.7f, head.z + cz[k]);
+            t[k] = Vector3(head.x + cx[k], head.y + 0.15f, head.z + cz[k]);
+        }
+        const Vector3 pts[16] = {b[0], b[1], b[2], b[3], b[0], t[0], t[1], b[1], t[1], t[2], b[2], t[2], t[3], b[3], t[3], t[0]};
+        Il2CppObject *lr = g_espBox[i].get();
+        for (int k = 0; k < 16; k++) G.lrSetPosition[lr](k, pts[k]);
+        if (f_espTracers && Alive(rh)) {
+            if (!g_espTr[i].get() && !MakeEspLine(g_espTrGo[i], g_espTr[i], 2, 0.006f, T().bgA)) continue;
+            Show(g_espTrGo[i], true);
+            G.lrSetPosition[g_espTr[i].get()](0, G.trGetPosition[rh]());
+            G.lrSetPosition[g_espTr[i].get()](1, head - Vector3(0, 0.5f, 0));
+        } else Show(g_espTrGo[i], false);
+    }
+}
+
+// ---- world looks: no fog, bright world -------------------------------------------------
+static bool g_worldFogSaved = false, g_oldFog = false, g_worldAmbSaved = false;
+static int g_oldAmbMode = 0;
+static Color g_oldAmb = Color(1, 1, 1, 1);
+static double g_nextWorld = 0;
+static void WorldReset() { g_worldFogSaved = false; g_worldAmbSaved = false; g_nextWorld = 0; }
+static void WorldTick() {
+    if (g_time < g_nextWorld) return;
+    g_nextWorld = g_time + 0.5;                               // checked twice a second, so scene loads can't undo it
+    if (G.rsSetFog.IsValid() && G.rsGetFog.IsValid()) {
+        if (f_noFog) {
+            if (!g_worldFogSaved) { g_oldFog = G.rsGetFog(); g_worldFogSaved = true; }
+            G.rsSetFog(false);
+        } else if (g_worldFogSaved) { G.rsSetFog(g_oldFog); g_worldFogSaved = false; }
+    }
+    if (G.rsSetAmbientMode.IsValid() && G.rsSetAmbientLight.IsValid() && G.rsGetAmbientMode.IsValid() && G.rsGetAmbientLight.IsValid()) {
+        if (f_bright) {
+            if (!g_worldAmbSaved) { g_oldAmbMode = G.rsGetAmbientMode(); g_oldAmb = G.rsGetAmbientLight(); g_worldAmbSaved = true; }
+            G.rsSetAmbientMode(3);                            // Flat
+            G.rsSetAmbientLight(Color(0.85f, 0.85f, 0.85f, 1));
+        } else if (g_worldAmbSaved) {
+            G.rsSetAmbientMode(g_oldAmbMode);
+            G.rsSetAmbientLight(g_oldAmb);
+            g_worldAmbSaved = false;
+        }
+    }
+}
+
+// Called when you change room: forget everything that belonged to the old one.
+static void V2Reset() {
+    g_jumpBoosted = nullptr;
+    g_armActive = -1;
+    g_armsTracker = false;
+    g_armFieldPlayer = nullptr;
+    g_speedoHave = false;
+    g_ropeHavePos = false;
+    EspReset();
+    WorldReset();
+    SoundAbort();
 }
 
 // ---- callbacks ---------------------------------------------------------------
@@ -1791,8 +2548,8 @@ static void OnUpdate(float dt) {
     VelocityFlyTick(in);
     CarTick(in);
     IronManTick(in, dt);
-    RopeTick(in);
-    SpeedBoostTick(in);
+    RopeTick(in, dt);
+    SpeedBoostTick(in, dt);
     ApplyGravity();
     NoclipTick(in);
     TeleportGunTick(in);
@@ -1800,12 +2557,15 @@ static void OnUpdate(float dt) {
     catch (...) { g_itemQueue.clear(); ym::log("prisma: item code error"); }
     ArmsTick();
     DanceTick(in, dt);              // last: it moves your hands after everything else
-    RecordVelocity();
+    SpeedoTick(dt);
+    EspTick();
+    WorldTick();
+    SoundTick();
 }
 
 YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     if (!ym::init(api)) return -1;
     ym::onUpdate(OnUpdate);
-    ym::log("Prisma Client V1 loaded on %s (%s)", api->gameVersion, api->buildId);
+    ym::log("Prisma Client V2 loaded on %s (%s)", api->gameVersion, api->buildId);
     return 0;
 }
